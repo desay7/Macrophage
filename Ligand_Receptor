@@ -1,0 +1,158 @@
+#############################################
+# NicheNet Analysis: Neonatal Lung (Mouse)
+# Comparing Ligand Activity in ABX vs NABX
+# Author: Hitesh Deshmukh 
+# Date: 06/10/2025
+#############################################
+
+# ==== 1. Load Required Libraries ====
+library(Seurat)
+library(nichenetr)
+library(tidyverse)
+library(igraph)
+library(ggraph)
+library(clusterProfiler)
+library(org.Mm.eg.db)
+
+# ==== 2. Load Data ====
+A <- readRDS("seu.all1.RDS")
+
+# ==== 3. Subset Data to Neonatal ABX and NABX ====
+sender_celltypes <- c("Alveolar type 2 cell", "AT1/AT2")
+receiver_celltype <- "Alveolar macrophage"
+
+seurat_neonatal <- subset(A, subset = age == "Neonate" & 
+                                celltype_level3_fullname %in% c(sender_celltypes, receiver_celltype))
+
+Idents(seurat_neonatal) <- "exp"
+DefaultAssay(seurat_neonatal) <- "RNA"
+seurat_neonatal <- JoinLayers(seurat_neonatal)
+
+# ==== 4. Load NicheNet Database ====
+setwd('/data/Deshmukh-Lab/Macrophage')
+ligand_target_matrix <- readRDS("ligand_target_matrix_nsga2r_final_mouse.rds")
+lr_network <- readRDS("lr_network_mouse_21122021.rds")
+weighted_networks <- readRDS("weighted_networks_nsga2r_final_mouse.rds")
+
+# ==== 5. Helper Functions ====
+get_expressed_genes_in_cluster <- function(seurat_obj, pct = 0.10) {
+  gene_pct <- rowSums(GetAssayData(seurat_obj, slot = "data") > 0) / ncol(seurat_obj)
+  names(gene_pct[gene_pct > pct])
+}
+
+get_DE_genes <- function(seurat_obj, receiver, group1, group2, lfc = 0.15, p = 0.05) {
+  receiver_cells <- subset(seurat_obj, subset = celltype_level3_fullname == receiver)
+  Idents(receiver_cells) <- "exp"
+  receiver_cells <- JoinLayers(receiver_cells)
+  deg <- FindMarkers(receiver_cells, ident.1 = group1, ident.2 = group2, logfc.threshold = lfc)
+  rownames(deg[deg$p_val_adj < p, ])
+}
+
+# ==== 6. Get DE Genes per Condition ====
+geneset_oi_abx <- get_DE_genes(seurat_neonatal, receiver_celltype, "ABX", "NABX")
+geneset_oi_nabx <- get_DE_genes(seurat_neonatal, receiver_celltype, "NABX", "ABX")
+
+# ==== 7. Get Expressed Genes and Potential Ligands ====
+Idents(seurat_neonatal) <- "celltype_level3_fullname"
+expressed_genes_receiver <- get_expressed_genes(receiver_celltype, seurat_neonatal, pct = 0.10)
+expressed_genes_sender <- get_expressed_genes(sender_celltypes, seurat_neonatal, pct = 0.10)
+
+lr_network_filtered <- lr_network %>%
+  filter(from %in% expressed_genes_sender & to %in% expressed_genes_receiver)
+
+potential_ligands <- unique(lr_network_filtered$from)
+
+# ==== 8. Run Ligand Activity Prediction ====
+ligand_activities_abx <- predict_ligand_activities(
+  geneset = geneset_oi_abx,
+  background_expressed_genes = expressed_genes_receiver,
+  ligand_target_matrix = ligand_target_matrix,
+  potential_ligands = potential_ligands
+)
+
+ligand_activities_nabx <- predict_ligand_activities(
+  geneset = geneset_oi_nabx,
+  background_expressed_genes = expressed_genes_receiver,
+  ligand_target_matrix = ligand_target_matrix,
+  potential_ligands = potential_ligands
+)
+
+# ==== 9. Compare Ligand Activities ====
+comparison_df <- left_join(
+  ligand_activities_nabx %>% select(test_ligand, NABX = pearson),
+  ligand_activities_abx %>% select(test_ligand, ABX = pearson),
+  by = "test_ligand"
+) %>%
+  mutate(delta = NABX - ABX) %>%
+  arrange(desc(delta))
+
+# ==== 10. Plot Δ Pearson Correlation ====
+ggplot(comparison_df, aes(x = reorder(test_ligand, delta), y = delta)) +
+  geom_col(fill = "steelblue") +
+  coord_flip() +
+  labs(title = "Δ Pearson (NABX - ABX): Ligand Activity", x = "Ligand", y = "Delta Pearson") +
+  theme_minimal()
+
+# ==== 11. Save Top Ligands ====
+top_ligands <- comparison_df %>%
+  mutate(abs_delta = abs(delta)) %>%
+  top_n(20, abs_delta) %>%
+  arrange(desc(delta))
+
+write.csv(top_ligands, "top_ligand_differences.csv")
+
+# ==== 12. Ligand–Receptor–Target Network ====
+ligands_of_interest <- c("Tnf", "Il10", "Tgfb1", "Ccl7")
+lr_network_clean <- lr_network %>%
+  filter(!is.na(from) & !is.na(to), nchar(from) > 2, nchar(to) > 2)
+
+edges_all <- data.frame(from = character(), to = character(), type = character())
+
+for (ligand in ligands_of_interest) {
+  receptors <- lr_network_clean %>%
+    filter(from == ligand) %>%
+    pull(to) %>%
+    unique()
+  
+  target_scores <- as.numeric(ligand_target_matrix[ligand, ])
+  names(target_scores) <- colnames(ligand_target_matrix)
+  top_targets <- sort(target_scores, decreasing = TRUE)[1:20] %>% names()
+  
+  edges_lr <- data.frame(from = ligand, to = receptors, type = "ligand_receptor")
+  
+  if (length(receptors) > 0 & length(top_targets) > 0) {
+    edges_rt <- expand.grid(from = receptors, to = top_targets, stringsAsFactors = FALSE) %>%
+      mutate(type = "receptor_target")
+    edges_all <- bind_rows(edges_all, edges_lr, edges_rt)
+  } else {
+    edges_all <- bind_rows(edges_all, edges_lr)
+  }
+}
+
+# Define node types
+nodes <- unique(c(edges_all$from, edges_all$to))
+node_type <- case_when(
+  nodes %in% ligands_of_interest ~ "Ligand",
+  nodes %in% lr_network_clean$to ~ "Receptor",
+  TRUE ~ "Target"
+)
+
+graph_all <- graph_from_data_frame(edges_all, vertices = data.frame(name = nodes, type = node_type))
+
+# Plot network
+ggraph(graph_all, layout = "fr") +
+  geom_edge_link(aes(color = type), alpha = 0.5) +
+  geom_node_point(aes(color = type), size = 4) +
+  geom_node_text(aes(label = name), repel = TRUE, size = 2.5) +
+  scale_color_manual(values = c(
+    "Ligand" = "firebrick",
+    "Receptor" = "steelblue",
+    "Target" = "darkgreen",
+    "ligand_receptor" = "pink",
+    "receptor_target" = "gray50"
+  )) +
+  theme_void() +
+  labs(title = "Ligand–Receptor–Target Network (Mouse)")
+
+# ==== 13. Session Info ====
+sessionInfo()
