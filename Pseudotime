@@ -1,0 +1,93 @@
+#############################################################
+# Pseudotime Analysis of Neonatal Alveolar Macrophages
+# Author: Hitesh Deshmukh
+# Last Updated: 06/10/2025
+#############################################################
+
+# ==== 1. Load Libraries ====
+library(Seurat)
+library(monocle3)
+library(SeuratWrappers)
+library(dplyr)
+library(ggplot2)
+library(ggpubr)
+
+# ==== 2. Load Seurat Object ====
+setwd('/data/Deshmukh-Lab/Macrophage')
+seu <- readRDS('seu.remapped.RDS')
+
+# ==== 3. Subset Neonatal AMs ====
+neonate_AMs <- subset(seu, subset = cond %in% c("Neonate_ABX", "Neonate_NABX") &
+                        revised.ids %in% c("AM_Newborn_1", "AM_Newborn_Inflammatory"))
+DimPlot(neonate_AMs, split.by = 'cond')
+
+# ==== 4. Setup for Monocle3 ====
+neonate_AMs$condition <- neonate_AMs$cond
+Idents(neonate_AMs) <- 'revised.ids'
+FeaturePlot(neonate_AMs, features = c('Marco', 'Pparg', 'Cd36'), label = TRUE)
+
+cds <- as.cell_data_set(neonate_AMs)
+cds <- cluster_cells(cds, reduction_method = "UMAP")
+cds <- learn_graph(cds)
+
+# ==== 5. Root Cell Selection and Pseudotime Ordering ====
+# Interactive root cell selection (manual GUI)
+# root_cells_selected <- choose_cells(cds)
+# root_cells_names <- colnames(root_cells_selected)
+
+# If root cells are already known:
+# e.g., barcodes from AM_Newborn_1 in Neonate_NABX
+root_cells_names <- colnames(neonate_AMs)[neonate_AMs$cond == "Neonate_NABX" &
+                                          neonate_AMs$revised.ids == "AM_Newborn_1"][1:10]  # or full list
+
+cds <- order_cells(cds, root_cells = root_cells_names)
+
+# ==== 6. Visualization ====
+# UMAP colored by pseudotime
+plot_cells(cds, color_cells_by = "pseudotime", label_groups_by_cluster = TRUE, label_leaves = TRUE, label_branch_points = TRUE)
+
+# UMAP colored by condition
+plot_cells(cds, color_cells_by = "condition", label_groups_by_cluster = FALSE, label_leaves = TRUE, label_branch_points = TRUE)
+
+# ==== 7. Pseudotime Analysis ====
+pseudotime_df <- data.frame(
+  pseudotime = pseudotime(cds),
+  condition = colData(cds)$condition
+)
+
+# Density plot
+ggplot(pseudotime_df, aes(x = pseudotime, color = condition)) +
+  geom_density(size = 1.2, adjust = 1.2) +
+  scale_color_manual(values = c("Neonate_ABX" = "red", "Neonate_NABX" = "blue")) +
+  labs(title = "Pseudotime Density by Condition", x = "Pseudotime", y = "Density") +
+  theme_minimal(base_size = 14)
+
+# ==== 8. Statistical Testing ====
+# KS and Wilcoxon tests
+abx_pseudo <- pseudotime_df$pseudotime[pseudotime_df$condition == "Neonate_ABX"]
+nabx_pseudo <- pseudotime_df$pseudotime[pseudotime_df$condition == "Neonate_NABX"]
+
+ks_result <- ks.test(abx_pseudo, nabx_pseudo)
+wilcox_result <- wilcox.test(abx_pseudo, nabx_pseudo)
+
+print(ks_result)
+print(wilcox_result)
+
+# Violin plot with p-value
+ggplot(pseudotime_df, aes(x = condition, y = pseudotime, fill = condition)) +
+  geom_violin(trim = FALSE, alpha = 0.6, width = 0.8) +
+  geom_boxplot(width = 0.2, outlier.shape = NA, fill = "white") +
+  stat_compare_means(method = "wilcox.test", label = "p.format", label.y.npc = "top") +
+  scale_fill_manual(values = c("Neonate_ABX" = "red", "Neonate_NABX" = "blue")) +
+  labs(title = "Pseudotime by Condition", x = "Condition", y = "Pseudotime") +
+  theme_minimal(base_size = 14) +
+  theme(legend.position = "none")
+
+# ==== 9. AM Maturity Signature ====
+mature_am_genes <- c("Pparg", "Car4", "Marco", "Ear1")
+
+neonate_AMs <- AddModuleScore(neonate_AMs, features = list(mature_am_genes), name = "AM_Maturity")
+
+# Violin plot for maturity score
+VlnPlot(neonate_AMs, features = "AM_Maturity1", group.by = "cond", pt.size = 0.5) +
+  stat_compare_means(method = "wilcox.test", label = "p.signif")
