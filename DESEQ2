@@ -1,0 +1,114 @@
+#############################################################
+# Pseudobulk DESeq2 + GO Enrichment + Heatmap Visualization
+# Author: Hitesh Deshmukh
+# Last Updated: 06/10/2025
+#############################################################
+
+# ==== 1. Load Libraries ====
+library(Seurat)
+library(dplyr)
+library(Matrix)
+library(DESeq2)
+library(clusterProfiler)
+library(org.Mm.eg.db)
+library(pheatmap)
+
+# ==== 2. Add Sample Condition Metadata ====
+# Assumes 'orig.ident' is already in your Seurat object (seu)
+seu$cond <- case_when(
+  seu$orig.ident %in% c("Neonate_NABX1", "Neonate_NABX2") ~ "Neonate_NABX",
+  seu$orig.ident %in% c("Neonate_ABX1", "Neonate_ABX2")   ~ "Neonate_ABX",
+  seu$orig.ident %in% c("Adult_NABX1",   "Adult_NABX2")   ~ "Adult_NABX",
+  seu$orig.ident %in% c("Adult_ABX1",    "Adult_ABX2")    ~ "Adult_ABX",
+  TRUE ~ "Other"
+)
+table(seu$cond)
+
+# ==== 3. Generate Pseudobulk Counts ====
+get_pseudobulk_counts <- function(seurat_obj, replicate_col = "orig.ident") {
+  counts <- GetAssayData(seurat_obj, slot = "counts")
+  cell2rep <- seurat_obj@meta.data[[replicate_col]]
+  pseudo_list <- lapply(unique(cell2rep), function(rep_id) {
+    rowSums(counts[, cell2rep == rep_id, drop = FALSE])
+  })
+  pb_mat <- do.call(cbind, pseudo_list)
+  colnames(pb_mat) <- unique(cell2rep)
+  return(pb_mat)
+}
+
+pb_counts <- get_pseudobulk_counts(seu, replicate_col = "orig.ident")
+
+# ==== 4. Build Sample Metadata for DESeq2 ====
+replicate_ids <- colnames(pb_counts)
+sample_meta <- data.frame(
+  replicate = replicate_ids,
+  cond = sapply(replicate_ids, function(x) unique(seu$cond[seu$orig.ident == x])),
+  row.names = replicate_ids
+)
+
+# ==== 5. Create DESeq2 Object ====
+dds <- DESeqDataSetFromMatrix(
+  countData = pb_counts,
+  colData = sample_meta,
+  design = ~ cond
+)
+
+# Optional: filter low-expressed genes
+keep_genes <- rowSums(counts(dds) >= 10) >= 2
+dds <- dds[keep_genes, ]
+
+dds <- DESeq(dds)
+
+# ==== 6. DE Results ====
+res_neonate <- results(dds, contrast = c("cond", "Neonate_NABX", "Neonate_ABX"))
+res_neonate <- lfcShrink(dds, contrast = c("cond", "Neonate_NABX", "Neonate_ABX"), res = res_neonate, type = "ashr")
+
+res_adult <- results(dds, contrast = c("cond", "Adult_NABX", "Adult_ABX"))
+res_adult <- lfcShrink(dds, contrast = c("cond", "Adult_NABX", "Adult_ABX"), res = res_adult, type = "ashr")
+
+# ==== 7. Filter Significant Genes ====
+alpha <- 0.01
+lfc_threshold <- 1
+
+sig_genes_neonate <- rownames(res_neonate)[which(res_neonate$padj < alpha & abs(res_neonate$log2FoldChange) > lfc_threshold)]
+sig_genes_adult  <- rownames(res_adult)[which(res_adult$padj < alpha & abs(res_adult$log2FoldChange) > lfc_threshold)]
+
+common_genes <- union(sig_genes_neonate, sig_genes_adult)
+length(common_genes)  # For reference
+
+# ==== 8. GO Enrichment ====
+ego <- enrichGO(
+  gene          = common_genes,
+  OrgDb         = org.Mm.eg.db,
+  keyType       = "SYMBOL",
+  ont           = "BP",
+  pAdjustMethod = "BH",
+  qvalueCutoff  = 0.05,
+  readable      = TRUE
+)
+head(ego)
+
+# ==== 9. Get Genes from Top GO Terms ====
+top_terms <- head(ego$ID, 10)
+ego_subset <- ego[ego$ID %in% top_terms, ]
+gene_sets_of_interest <- unique(unlist(strsplit(ego_subset$geneID, split = "/")))
+length(gene_sets_of_interest)
+
+# ==== 10. Create Heatmap Matrix ====
+rld <- rlogTransformation(dds, blind = FALSE)
+rld_mat <- assay(rld)
+
+go_genes_mat <- rld_mat[intersect(gene_sets_of_interest, rownames(rld_mat)), , drop = FALSE]
+
+sample_anno <- data.frame(colData(dds)[, c("cond", "replicate")])
+
+# ==== 11. Plot Heatmap ====
+pheatmap(
+  go_genes_mat,
+  scale = "row",
+  cluster_rows = TRUE,
+  cluster_cols = TRUE,
+  show_rownames = TRUE,
+  annotation_col = sample_anno,
+  main = "Top GO Biological Process Genes"
+)
