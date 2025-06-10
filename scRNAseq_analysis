@@ -1,0 +1,124 @@
+##########################################################
+# scRNA-seq Processing Pipeline for Mouse Lung Macrophage
+# Author: Hitesh Deshmukh
+# Last Updated: 06/10/2025
+##########################################################
+
+# ==== 1. Clear Environment and Load Libraries ====
+rm(list = ls())
+
+library(tidyverse)
+library(Seurat)
+library(Matrix)
+library(DropletUtils)
+library(reshape2)
+library(SeuratWrappers)
+library(biomaRt)
+
+# ==== 2. Load 10x Data and Create Seurat Objects ====
+data_directory <- "/Users/desay7/Macrophage_HD"
+sample_dirs <- list.dirs(data_directory, full.names = TRUE, recursive = FALSE)
+
+seurat_list <- list()
+for (sample_dir in sample_dirs) {
+  sample_name <- basename(sample_dir)
+  data <- Read10X(data.dir = sample_dir, gene.column = 2)
+  seurat_obj <- CreateSeuratObject(counts = data, project = sample_name)
+  seurat_list[[sample_name]] <- seurat_obj
+}
+
+# Merge all samples
+seu <- merge(x = seurat_list[[1]], y = seurat_list[-1], add.cell.ids = names(seurat_list))
+
+# ==== 3. QC and Filtering ====
+seu[["percent.mt"]] <- PercentageFeatureSet(seu, pattern = "^mt-")
+seu[["percent.rps"]] <- PercentageFeatureSet(seu, pattern = "^Rps")
+seu[["percent.rpl"]] <- PercentageFeatureSet(seu, pattern = "^Rpl")
+seu$percent.rp <- seu$percent.rps + seu$percent.rpl
+
+# Filter by feature and count thresholds
+seu <- subset(seu, subset = nFeature_RNA > 200 & nFeature_RNA < 7500 &
+                        nCount_RNA > 400 & nCount_RNA < 40000 &
+                        percent.mt < 5)
+
+# Filter genes expressed in at least 200 cells
+seu <- JoinLayers(seu)
+normalized_data <- GetAssayData(seu, assay = "RNA", layer = "counts")
+keep_genes <- rowSums(normalized_data >= 1) >= 200
+seu <- subset(seu, features = names(keep_genes[keep_genes]))
+
+# ==== 4. Cell Cycle Scoring ====
+mart <- useMart("ensembl", dataset = "mmusculus_gene_ensembl")
+s.genes.mouse <- getBM(attributes = "external_gene_name", filters = "external_gene_name", 
+                       values = cc.genes$s.genes, mart = mart)$external_gene_name
+g2m.genes.mouse <- getBM(attributes = "external_gene_name", filters = "external_gene_name", 
+                         values = cc.genes$g2m.genes, mart = mart)$external_gene_name
+
+Genes <- rownames(seu)
+s.genes <- s.genes.mouse[s.genes.mouse %in% Genes]
+g2m.genes <- g2m.genes.mouse[g2m.genes.mouse %in% Genes]
+seu <- CellCycleScoring(seu, s.features = s.genes, g2m.features = g2m.genes, set.ident = TRUE)
+
+# ==== 5. Integration Using RPCA ====
+object.list <- SplitObject(seu, split.by = 'orig.ident')
+object.list <- lapply(object.list, function(x) {
+  x <- NormalizeData(x)
+  x <- FindVariableFeatures(x)
+  x <- ScaleData(x, verbose = FALSE)
+  x <- RunPCA(x, verbose = FALSE)
+  return(x)
+})
+
+features <- SelectIntegrationFeatures(object.list)
+anchors <- FindIntegrationAnchors(object.list, reduction = "rpca", dims = 1:20)
+seu <- IntegrateData(anchorset = anchors, dims = 1:20)
+
+# ==== 6. Dimensionality Reduction and Clustering ====
+seu <- ScaleData(seu)
+seu <- RunPCA(seu)
+seu <- FindNeighbors(seu, dims = 1:5)
+seu <- FindClusters(seu, resolution = 0.1)
+seu <- RunUMAP(seu, dims = 1:5)
+Idents(seu) <- "seurat_clusters"
+
+# Visualization
+DimPlot(seu, label = TRUE, repel = TRUE, split.by = "exp") + NoLegend()
+DimPlot(seu, label = TRUE, repel = TRUE)
+
+# ==== 7. Identify Marker Genes ====
+DefaultAssay(seu) <- "RNA"
+seu <- JoinLayers(seu)
+Immune.markers <- FindAllMarkers(seu, only.pos = TRUE, min.pct = 0.25, logfc.threshold = 0.25)
+Cluster.top.markers <- Immune.markers %>%
+  group_by(cluster) %>%
+  top_n(n = 20, wt = avg_log2FC)
+View(Cluster.top.markers)
+
+# Example feature plots for macrophage/dendritic markers
+FeaturePlot(seu, features = c('Siglecf', 'Marco'), label = TRUE)      # Alveolar macs
+FeaturePlot(seu, features = c('C1qa', 'Mertk', 'Adgre1', 'C5ar1'))    # Interstitial macs
+FeaturePlot(seu, features = c('Zbtb46'))                              # Dendritic cells
+
+# ==== 8. Label Transfer from Lung Cell Atlas ====
+lung.ref <- readRDS("/Users/desay7/Macrophage_HD/LungMAP_MouseLungDevelopment_CellRef_Seed.v1.1.rds")
+DefaultAssay(lung.ref) <- "RNA"
+DefaultAssay(seu) <- "RNA"
+
+# Prep for label transfer
+lung.ref <- FindVariableFeatures(lung.ref, selection.method = "vst", nfeatures = 3000)
+lung.query <- NormalizeData(seu)
+lung.query <- FindVariableFeatures(lung.query, selection.method = "vst", nfeatures = 3000)
+
+# Anchors and transfer
+query.anchors <- FindTransferAnchors(reference = lung.ref, query = lung.query, dims = 1:30)
+predictions <- TransferData(anchorset = query.anchors, refdata = lung.ref$celltype_level3_fullname, dims = 1:30)
+lung.query <- AddMetaData(lung.query, metadata = predictions)
+lung.query$celltype_level3_fullname <- lung.query$predicted.id
+
+# Visualization and summary
+Idents(lung.query) <- "celltype_level3_fullname"
+DimPlot(lung.query, label = TRUE)
+table(lung.query$celltype_level3_fullname)
+
+# ==== 9. Save Processed Object ====
+saveRDS(lung.query, file = "/Users/desay7/Macrophage_HD/seu1.RDS")
